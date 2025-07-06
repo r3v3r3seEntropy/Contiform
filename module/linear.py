@@ -4,8 +4,8 @@
 import torchcde
 import torch
 from torch import nn
-from ..module.ode import build_fc_odefunc, TimeVariableODE
-from ..module.interpolate import linear_interpolation_coeffs, hermite_cubic_coefficients_with_backward_differences
+from ode import build_fc_odefunc, TimeVariableODE
+from interpolate import linear_interpolation_coeffs, hermite_cubic_coefficients_with_backward_differences
 
 PAD = 0
 

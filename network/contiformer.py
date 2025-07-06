@@ -6,6 +6,7 @@ import math
 import torch
 from torch import nn
 import torch.nn.functional as F
+import math
 import sys
 import os
 
@@ -25,10 +26,26 @@ except ImportError:
     # Fallback for local execution
     try:
         import sys
-        sys.path.append('../module')
+        import os
+        # Get parent directory (Contiform root)
+        parent_dir = os.path.dirname(current_dir)
+        module_path = os.path.join(parent_dir, 'module')
+        if module_path not in sys.path:
+            sys.path.insert(0, module_path)
+        
+        # Try importing with dependencies check
+        import torchcde
+        import torchdiffeq
         from linear import ODELinear, InterpLinear
         from positional_encoding import PositionalEncoding
-    except ImportError:
+        print("Successfully loaded ODE modules")
+    except ImportError as e:
+        print(f"Warning: Could not import ODE modules: {e}")
+        if 'torchcde' in str(e):
+            print("Missing dependency: torchcde. Install with: pip install torchcde")
+        elif 'torchdiffeq' in str(e):
+            print("Missing dependency: torchdiffeq. Install with: pip install torchdiffeq")
+        
         # Create dummy classes if modules not available
         class ODELinear(nn.Module):
             def __init__(self, d_model, d_out, args_ode):
@@ -84,21 +101,41 @@ class MultiHeadAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, q, k, v, t, mask=None):
-        d_k, n_head = self.d_k, self.n_head
+        d_k, d_v, n_head = self.d_k, self.d_v, self.n_head
         sz_b, len_q, len_k, len_v = q.size(0), q.size(1), k.size(1), v.size(1)
 
         residual = q
         if self.normalize_before:
             q = self.layer_norm(q)
 
-        # Pass through the pre-attention projection: b x lq x (n*dv)
-        # Separate different heads: b x lq x n x dv
-        q = self.w_qs(q, t).view(sz_b, len_q, len_q, -1, n_head, d_k)
-        k = self.w_ks(k, t).view(sz_b, len_k, len_k, -1, n_head, d_k)
-        v = self.w_vs(v, t).view(sz_b, len_v, len_v, -1, n_head, d_k)
-
-        # Transpose for attention dot product: b x n x lq x dv
-        q, k, v = q.permute(0, 4, 1, 2, 3, 5), k.permute(0, 4, 1, 2, 3, 5), v.permute(0, 4, 1, 2, 3, 5)
+        # Pass through ODE projections
+        # ODE outputs are 5D: [B, T, T, K, D]
+        q = self.w_qs(q, t)  # [B, T_q, T_q, K, n_head * d_k]
+        k = self.w_ks(k, t)  # [B, T_k, T_k, K, n_head * d_k]
+        v = self.w_vs(v, t)  # [B, T_v, T_v, K, n_head * d_v]
+        
+        # Handle both ODE (5D) and standard (3D) outputs
+        if len(q.shape) == 5:  # ODE output format
+            # Reshape to separate heads
+            # [B, T, T, K, n_head * d] -> [B, T, T, K, n_head, d]
+            q = q.view(sz_b, len_q, len_q, -1, n_head, d_k)
+            k = k.view(sz_b, len_k, len_k, -1, n_head, d_k)
+            v = v.view(sz_b, len_v, len_v, -1, n_head, d_v)
+            
+            # Transpose for attention: [B, n_head, T_q, T_k, K, d]
+            q = q.permute(0, 4, 1, 2, 3, 5)
+            k = k.permute(0, 4, 1, 2, 3, 5)
+            v = v.permute(0, 4, 1, 2, 3, 5)
+        else:  # Standard 3D format from dummy ODE modules
+            # Reshape to separate heads
+            q = q.view(sz_b, len_q, n_head, d_k)
+            k = k.view(sz_b, len_k, n_head, d_k)
+            v = v.view(sz_b, len_v, n_head, d_v)
+            
+            # Transpose for attention: [B, n_head, T, d]
+            q = q.permute(0, 2, 1, 3)
+            k = k.permute(0, 2, 1, 3)
+            v = v.permute(0, 2, 1, 3)
 
         if mask is not None:
             mask = mask.unsqueeze(1)  # For head axis broadcasting.
@@ -122,12 +159,12 @@ class MultiHeadAttention(nn.Module):
 
         # Pass through the pre-attention projection: b x lq x (n*dv)
         # Separate different heads: b x lq x n x dv
-        q = self.w_qs.interpolate(q, t, qt, mask=mask).view(sz_b, len_qt, len_q, -1, n_head, d_k)
-        k = self.w_ks.interpolate(k, t, qt).view(sz_b, len_qt, len_k, -1, n_head, d_k)
-        v = self.w_vs.interpolate(v, t, qt).view(sz_b, len_qt, len_v, -1, n_head, d_k)
+        q = self.w_qs.interpolate(q, t, qt, mask=mask).view(sz_b, len_qt, -1, n_head, d_k)
+        k = self.w_ks.interpolate(k, t, qt).view(sz_b, len_qt, -1, n_head, d_k)
+        v = self.w_vs.interpolate(v, t, qt).view(sz_b, len_qt, -1, n_head, d_k)
 
         # Transpose for attention dot product: b x n x lq x dv
-        q, k, v = q.permute(0, 4, 1, 2, 3, 5), k.permute(0, 4, 1, 2, 3, 5), v.permute(0, 4, 1, 2, 3, 5)
+        q, k, v = q.permute(0, 3, 1, 2, 4), k.permute(0, 3, 1, 2, 4), v.permute(0, 3, 1, 2, 4)
 
         if mask is not None:
             mask = mask.unsqueeze(1)  # For head axis broadcasting.
@@ -182,26 +219,56 @@ class ScaledDotProductAttention(nn.Module):
         self.dropout = nn.Dropout(attn_dropout)
 
     def forward(self, q, k, v, mask=None):
-        # if q is ODELinear, attn = (q.transpose(2, 3).flip(dims=[-2]) / self.temperature * k).sum(dim=-1).sum(dim=-1)
-        attn = (q / self.temperature * k).sum(dim=-1).sum(dim=-1)
-
-        if mask is not None:
-            attn = attn.masked_fill(mask, -1e9)
-
-        attn = self.dropout(F.softmax(attn, dim=-1))
-
-        output = (attn.unsqueeze(-1) * v.sum(dim=-2)).sum(dim=-2)
+        # Handle ODE outputs: q, k, v can be either 4D or 6D tensors
+        # 4D: [batch, n_head, seq_len, d_k] (standard)
+        # 6D: [batch, n_head, T_q, T_k, K, d_k] (ODE output)
+        
+        if len(q.shape) == 6:  # ODE output format
+            # Compute attention scores by summing over d_k and K dimensions
+            # This is the Microsoft paper's approach for handling pairwise interactions
+            attn = (q / self.temperature * k).sum(dim=-1).sum(dim=-1)  # [B, n_head, T_q, T_k]
+            
+            if mask is not None:
+                attn = attn.masked_fill(mask, -1e9)
+                
+            attn = self.dropout(F.softmax(attn, dim=-1))
+            
+            # Apply attention to values
+            # v: [B, n_head, T_v, T_k, K, d_v]
+            # Sum over T_k dimension first, then K dimension
+            output = (attn.unsqueeze(-1) * v.sum(dim=-2)).sum(dim=-2)  # [B, n_head, T_q, d_v]
+            
+        else:  # Standard 4D format
+            d_k = q.size(-1)
+            
+            # Compute attention scores: [batch, n_head, seq_len, seq_len]
+            scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d_k)
+            
+            if mask is not None:
+                scores = scores.masked_fill(mask == 0, -1e9)
+            
+            attn = self.dropout(F.softmax(scores, dim=-1))
+            
+            # Apply attention to values: [batch, n_head, seq_len, d_k]
+            output = torch.matmul(attn, v)
+        
         return output, attn
 
     def interpolate(self, q, k, v, mask=None):
-        attn = (q / self.temperature * k).sum(dim=-1).sum(dim=-1)
-
+        # Standard scaled dot-product attention for interpolation
+        d_k = q.size(-1)
+        
+        # Compute attention scores: [batch, n_head, seq_len, seq_len]
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d_k)
+        
         if mask is not None:
-            attn = attn.masked_fill(mask == 0, -1e9)
-
-        attn = F.softmax(attn, dim=-1)
-
-        output = (attn.unsqueeze(-1) * v.sum(dim=-2)).sum(dim=-2)
+            scores = scores.masked_fill(mask == 0, -1e9)
+        
+        attn = F.softmax(scores, dim=-1)
+        
+        # Apply attention to values: [batch, n_head, seq_len, d_k]
+        output = torch.matmul(attn, v)
+        
         return output, attn
 
 
@@ -351,11 +418,18 @@ class ContiFormer(nn.Module):
         else:
             self.linear = None
 
+        # Add final linear layer for regression to single output
+        self.output_layer = nn.Linear(d_model, 1)
+
         self.max_length = max_length
         self.__output_size = d_model
         self.__hidden_size = d_model
 
     def forward(self, x, t=None, mask=None):
+        # Handle MagNav input shape: [batch, features, seq_len] -> [batch, seq_len, features]
+        if len(x.shape) == 3 and x.shape[2] == self.max_length:
+            x = x.transpose(1, 2)
+        
         if t is None:   # default to regular time series
             t = torch.linspace(0, 1, x.shape[1]).to(x.device)
             t = t.unsqueeze(0).repeat(x.shape[0], 1)
@@ -364,7 +438,10 @@ class ContiFormer(nn.Module):
             x = self.linear(x)
 
         enc_output = self.encoder(x, t, mask)
-        return enc_output, enc_output[:, -1, :]
+        # Take the last time step's output and map to single prediction
+        final_output = enc_output[:, -1, :]  # [batch, d_model]
+        prediction = self.output_layer(final_output)  # [batch, 1]
+        return prediction
 
     @property
     def output_size(self):

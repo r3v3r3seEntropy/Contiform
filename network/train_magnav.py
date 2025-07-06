@@ -22,7 +22,8 @@ import magnav
 from models.CNN import CNN, ResNet18
 from models.RNN import LSTM, GRU
 from models.MLP import MLP
-from models.ContiFormer import ContiFormer, DivFreeContiFormer, StandardContiFormer
+# Import the ODE-based ContiFormer
+from contiformer import ContiFormer
 from se3_contiformer import SE3ContiFormerMagNav
 
 
@@ -149,10 +150,20 @@ def make_training(model, epochs, train_loader, test_loader, scaling=['None']):
     - `train_loss_history` : history of loss values during training
     - `test_loss_history` : history of loss values during testing
     '''
-    # Optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=WEIGHT_DECAY)
-    lambda1 = lambda epoch: 0.9**epoch
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda1)
+    # Different hyperparameters for ContiFormer
+    if 'ContiFormer' in model.name or 'Transformer' in model.name:
+        # ContiFormer needs different hyperparameters
+        learning_rate = 0.0001  # Lower learning rate for transformers
+        optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01, betas=(0.9, 0.999))
+        # Cosine annealing with warm restarts
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-6)
+        print(f"Using ContiFormer optimization: AdamW with lr={learning_rate}, cosine annealing schedule")
+    else:
+        # Original settings for CNN/MLP
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=WEIGHT_DECAY)
+        lambda1 = lambda epoch: 0.9**epoch
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda1)
+        print(f"Using standard optimization: Adam with lr=0.001, exponential decay")
     
     # Create batch and epoch progress bar
     batch_bar = tqdm(total=len(train)//BATCH_SIZE,unit="batch",desc='Training',leave=False, position=0, ncols=150)
@@ -161,6 +172,8 @@ def make_training(model, epochs, train_loader, test_loader, scaling=['None']):
     train_loss_history = []
     test_loss_history = []
     Best_RMSE = 9e9
+    patience = 20  # Early stopping patience
+    patience_counter = 0
 
     for epoch in range(epochs):
 
@@ -190,6 +203,10 @@ def make_training(model, epochs, train_loader, test_loader, scaling=['None']):
 
             # Calculate gradients
             loss.backward()
+            
+            # Gradient clipping for ContiFormer
+            if 'ContiFormer' in model.name:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
             # Adjust learning weights
             optimizer.step()
@@ -205,7 +222,7 @@ def make_training(model, epochs, train_loader, test_loader, scaling=['None']):
         scheduler.step()
 
         # Compute the loss of the batch and save it
-        train_loss = train_running_loss / batch_index
+        train_loss = train_running_loss / (batch_index + 1)
         train_loss_history.append(train_loss)
 
         #----Test----#
@@ -248,13 +265,21 @@ def make_training(model, epochs, train_loader, test_loader, scaling=['None']):
             RMSE_epoch = magnav.rmse(scaling[3]+((preds-scaling[1])*(scaling[4]-scaling[3])/(scaling[2]-scaling[1])),
                                scaling[3]+((test.y[SEQ_LEN:]-scaling[1])*(scaling[4]-scaling[3])/(scaling[2]-scaling[1])),False)
 
-        test_loss = test_running_loss / batch_index
+        test_loss = test_running_loss / (batch_index + 1)
         test_loss_history.append(test_loss)
         
         # Save best model
         if Best_RMSE > RMSE_epoch:
             Best_RMSE = RMSE_epoch
             Best_model = model
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            
+        # Early stopping
+        if patience_counter >= patience:
+            print(f"\nEarly stopping triggered at epoch {epoch+1}")
+            break
 
         # Update epoch progress bar
         epoch_bar.set_postfix(train_loss=train_loss,test_loss=test_loss,RMSE=RMSE_epoch,lr=optimizer.param_groups[0]['lr'])
@@ -420,7 +445,7 @@ if __name__ == "__main__":
         "--shut", action="store_true", required=False, help="Shutdown pc after training is done."
     )
     parser.add_argument(
-        "-sc", "--scaling", type=int, required=False, default=0, help="Data scaling, 1 for standardization, 2 for MinMax scaling, 0 for no scaling, default=0. Ex : --scaling 0", metavar=''
+        "-sc", "--scaling", type=int, required=False, default=1, help="Data scaling, 1 for standardization, 2 for MinMax scaling, 0 for no scaling, default=1. Ex : --scaling 1", metavar=''
     )
     parser.add_argument(
         "-cor", "--corrections", type=int, required=False, default=3, help="Data correction, 0 for no corrections, 1 for IGRF correction, 2 for diurnal correction, 3 for IGRF+diurnal correction. Ex : --corrections 3", metavar=''
@@ -432,7 +457,7 @@ if __name__ == "__main__":
         "-tr", "--truth", type=str, required=False, default='IGRFMAG1', help="Name of the variable corresponding to the truth for training the model. Ex : --truth 'IGRFMAG1'", metavar=''
     )
     parser.add_argument(
-        "-ml", "--model", type=str, required=False, default='ContiFormer', help="Name of the model to use. Available models : 'MLP', 'CNN', 'ResNet18', 'LSTM', 'GRU', 'ContiFormer', 'DivFreeContiFormer', 'StandardContiFormer', 'SE3ContiFormer'. Ex : --model 'ContiFormer'", metavar=''
+        "-ml", "--model", type=str, required=False, default='ContiFormer', help="Name of the model to use. Available models : 'MLP', 'CNN', 'ResNet18', 'LSTM', 'GRU', 'ContiFormer', 'ContiFormerSimple', 'DivFreeContiFormer', 'StandardContiFormer', 'SE3ContiFormer'. Ex : --model 'ContiFormer'", metavar=''
     )
     parser.add_argument(
         "-wd", "--weight_decay", type=float, required=False, default=0.001, help="Adam weight decay value. Ex : --weight_decay 0.00001", metavar=''
@@ -477,7 +502,7 @@ if __name__ == "__main__":
             flights_num = [2,3]  # Reduced to 2 flights to save memory
             
             for n in flights_num:
-                df = pd.read_hdf('./data/processed/Flt_data.h5', key=f'Flt100{n}')
+                df = pd.read_hdf(r"C:\Users\Admin\Contiform\network\data\processed\Flt_data.h5", key=f'Flt100{n}')
                 flights[n] = df
             
             print(f'Data import done (2 flights for memory efficiency). Memory used {psutil.Process(os.getpid()).memory_info().rss / 1024 ** 2:.2f} Mb')
@@ -691,21 +716,38 @@ if __name__ == "__main__":
             model = GRU(SEQ_LEN,len(features)-2,32).to(DEVICE)
             model.name = model.__class__.__name__
         elif MODEL == 'ContiFormer':
-            model = ContiFormer(SEQ_LEN, len(features)-2, divergence_free=True).to(DEVICE)
-            print(f"\nCreated ContiFormer with divergence-free ODEs")
-            print(f"Model info: {model.get_model_info()}")
-            # Check divergence-free property
-            model.check_divergence_free_property(DEVICE)
-        elif MODEL == 'DivFreeContiFormer':
-            model = DivFreeContiFormer(SEQ_LEN, len(features)-2).to(DEVICE)
-            print(f"\nCreated DivFreeContiFormer")
-            print(f"Model info: {model.get_model_info()}")
-            # Check divergence-free property
-            model.check_divergence_free_property(DEVICE)
-        elif MODEL == 'StandardContiFormer':
-            model = StandardContiFormer(SEQ_LEN, len(features)-2).to(DEVICE)
-            print(f"\nCreated StandardContiFormer (without divergence-free)")
-            print(f"Model info: {model.get_model_info()}")
+            # Use ODE-based ContiFormer with proper parameters
+            model = ContiFormer(
+                input_size=len(features)-2,
+                d_model=256,
+                d_inner=1024,
+                n_layers=4,
+                n_head=4,
+                d_k=64,
+                d_v=64,
+                dropout=0.1,
+                max_length=SEQ_LEN,
+                # ODE-specific parameters
+                actfn_ode="softplus",
+                layer_type_ode="concat",
+                zero_init_ode=True,
+                atol_ode=1e-3,
+                rtol_ode=1e-3,
+                method_ode="rk4",
+                linear_type_ode="inside",
+                regularize=False,
+                approximate_method="last",
+                nlinspace=3,
+                interpolate_ode="linear",
+                itol_ode=1e-2,
+                divergence_free=True,  # Enable divergence-free vector fields
+                add_pe=False,
+                normalize_before=False
+            ).to(DEVICE)
+            model.name = MODEL
+            print(f"\nCreated ODE-based ContiFormer")
+            print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+
         elif MODEL == 'SE3ContiFormer':
             model = SE3ContiFormerMagNav(SEQ_LEN, len(features)-2).to(DEVICE)
             print(f"\nCreated SE3ContiFormer (SE(3) equivariant + divergence-free)")
