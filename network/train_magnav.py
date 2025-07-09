@@ -25,6 +25,8 @@ from models.MLP import MLP
 # Import the ODE-based ContiFormer
 from contiformer import ContiFormer
 from se3_contiformer import SE3ContiFormerMagNav
+from models.DivergencefreeMLP import DivergenceFreeMLP
+
 
 
 #-----------------#
@@ -257,13 +259,30 @@ def make_training(model, epochs, train_loader, test_loader, scaling=['None']):
         # Compute the loss of the batch and save it
         preds = np.concatenate(preds)
 
+                # --- Handle Subset wrapper ---
+        if isinstance(test, torch.utils.data.Subset):
+            full_targets = torch.stack([test.dataset[i][1] for i in test.indices[SEQ_LEN:]])
+        else:
+            full_targets = test.y[SEQ_LEN:]
+
+        # --- Truncate predictions and targets to matching length ---
+        min_len = min(preds.shape[0], full_targets.shape[0])
+        preds = preds[:min_len]
+        full_targets = full_targets[:min_len]
+
+        # --- Compute RMSE properly with scaling ---
         if scaling[0] == 'None':
-            RMSE_epoch = magnav.rmse(preds,test.y[SEQ_LEN:],False)
+            RMSE_epoch = magnav.rmse(preds, full_targets, False)
         elif scaling[0] == 'std':
-            RMSE_epoch = magnav.rmse(preds*scaling[2]+scaling[1],test.y[SEQ_LEN:]*scaling[2]+scaling[1],False)
+            RMSE_epoch = magnav.rmse(preds * scaling[2] + scaling[1], full_targets * scaling[2] + scaling[1], False)
         elif scaling[0] == 'minmax':
-            RMSE_epoch = magnav.rmse(scaling[3]+((preds-scaling[1])*(scaling[4]-scaling[3])/(scaling[2]-scaling[1])),
-                               scaling[3]+((test.y[SEQ_LEN:]-scaling[1])*(scaling[4]-scaling[3])/(scaling[2]-scaling[1])),False)
+            RMSE_epoch = magnav.rmse(
+                scaling[3] + ((preds - scaling[1]) * (scaling[4] - scaling[3]) / (scaling[2] - scaling[1])),
+                scaling[3] + ((full_targets - scaling[1]) * (scaling[4] - scaling[3]) / (scaling[2] - scaling[1])),
+                False
+            )
+
+
 
         test_loss = test_running_loss / (batch_index + 1)
         test_loss_history.append(test_loss)
@@ -466,6 +485,17 @@ if __name__ == "__main__":
         "--synthetic", action="store_true", required=False, help="Use synthetic data for testing when real flight data is not available."
     )
     
+    # added right now for MLP 
+    
+    parser.add_argument(
+        '--subset', type=int, default=None, help='Number of training samples to use (debug mode)'
+    )
+    parser.add_argument(
+        '--testsubset', type=int, default=None, help='Limit test set size for faster evaluation'
+    )
+
+
+    
     args = parser.parse_args()
     
     EPOCHS     = args.epochs
@@ -502,7 +532,7 @@ if __name__ == "__main__":
             flights_num = [2,3]  # Reduced to 2 flights to save memory
             
             for n in flights_num:
-                df = pd.read_hdf(r"C:\Users\Admin\Contiform\network\data\processed\Flt_data.h5", key=f'Flt100{n}')
+                df = pd.read_hdf("./data/processed/Flt_data.h5", key=f'Flt100{n}')
                 flights[n] = df
             
             print(f'Data import done (2 flights for memory efficiency). Memory used {psutil.Process(os.getpid()).memory_info().rss / 1024 ** 2:.2f} Mb')
@@ -678,8 +708,22 @@ if __name__ == "__main__":
         print('--------------------\n')
         
         # Split to train and test
+        # Split to train and test
         train = MagNavDataset(df, seq_len=SEQ_LEN, split='train', train_lines=train_lines[fold], test_lines=test_lines[fold], truth=TRUTH)
+        # Limit test data to subset (for debugging evaluation time)
+
+
         test  = MagNavDataset(df, seq_len=SEQ_LEN, split='test', train_lines=train_lines[fold], test_lines=test_lines[fold], truth=TRUTH)
+
+        if args.testsubset is not None:
+            test = torch.utils.data.Subset(test, range(min(args.testsubset, len(test))))
+            print(f"Using test subset: {len(test)} samples")
+            
+        # Limit training data to subset (for debugging speed)
+        if args.subset is not None:
+            train = torch.utils.data.Subset(train, range(min(args.subset, len(train))))
+            print(f"Using training subset: {len(train)} samples")
+
 
         # Dataloaders
         train_loader  = DataLoader(train,
@@ -700,6 +744,9 @@ if __name__ == "__main__":
             model.name = model.__class__.__name__
         elif MODEL == 'CNN':
             model = CNN(SEQ_LEN,len(features)-2).to(DEVICE)
+            model.name = model.__class__.__name__
+        elif MODEL == 'DFMLP':
+            model = DivergenceFreeMLP(seq_length=SEQ_LEN, n_features=len(features) - 2, output_dim=1).to(DEVICE)
             model.name = model.__class__.__name__
         elif MODEL == 'ResNet18':
             model = ResNet18().to(DEVICE)

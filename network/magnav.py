@@ -470,7 +470,7 @@ d2r = np.pi/180
 
 shc_fn = os.getenv(
     "MAGNAV_SHC_FN",
-    'C:/Users/Admin/Downloads/content/data/external/IGRF13.shc'  # ← Update to your file path
+    './data/external/IGRF13.shc'
 )
 
 # Geomagnetic reference radius:

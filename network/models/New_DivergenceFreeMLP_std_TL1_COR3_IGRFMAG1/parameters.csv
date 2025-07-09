@@ -1,0 +1,2 @@
+seq_len,epochs,batch_size,training_time,model,divergence_free
+20,5,128,1035.8893444538116,DFMLP,False
